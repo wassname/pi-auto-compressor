@@ -4,8 +4,44 @@ import {
   createState,
   resetState,
   createInputFingerprint,
+  type HermesMiddleLayout,
 } from "./state.js"
-import { applyPruning, generateHermesSummary } from "./pruner.js"
+import {
+  applyHermesMiddleLayout,
+  applyPruning,
+  estimateMessagesTokens,
+  generateHermesSummary,
+} from "./pruner.js"
+import { AUTO_COMPRESS_CONFIG } from "./config.js"
+
+function isContextEntry(entry: any): boolean {
+  if (entry?.type === "message" || entry?.type === "custom_message") return true
+  return entry?.type === "branch_summary" && Boolean(entry.summary)
+}
+
+function findFirstContextEntryId(entries: any[]): string | null {
+  return entries.find(isContextEntry)?.id ?? entries[0]?.id ?? null
+}
+
+function countContextEntries(entries: any[]): number {
+  return entries.filter(isContextEntry).length
+}
+
+function countContextEntriesFrom(entries: any[], firstEntryId: string): number {
+  const start = entries.findIndex((entry) => entry.id === firstEntryId)
+  if (start < 0) return 0
+  return countContextEntries(entries.slice(start))
+}
+
+function latestHermesLayout(entries: any[]): HermesMiddleLayout | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]
+    if (entry?.type !== "compaction") continue
+    const details = entry.details
+    return details?.kind === "hermes-middle" ? details as HermesMiddleLayout : null
+  }
+  return null
+}
 
 export default function (pi: ExtensionAPI) {
   const config = loadConfig(process.cwd())
@@ -58,7 +94,8 @@ export default function (pi: ExtensionAPI) {
   
   pi.on("session_start", async (event, ctx) => {
     resetState(state)
-    for (const entry of ctx.sessionManager.getBranch()) {
+    const branch = ctx.sessionManager.getBranch()
+    for (const entry of branch) {
       if (entry.type === "custom" && entry.customType === "dcp-state") {
         const data = entry.data as any
         if (data?.previousSummary) state.previousSummary = data.previousSummary
@@ -66,8 +103,10 @@ export default function (pi: ExtensionAPI) {
         if (data?.tokensSaved) state.tokensSaved = data.tokensSaved
         if (data?.prunedToolIds) state.prunedToolIds = new Set(data.prunedToolIds)
         if (data?.lastCompressionStatus) state.lastCompressionStatus = data.lastCompressionStatus
+        if (data?.activeHermesLayout) state.activeHermesLayout = data.activeHermesLayout
       }
     }
+    state.activeHermesLayout = latestHermesLayout(branch)
   })
   
   pi.on("session_shutdown", async (_event, _ctx) => {
@@ -77,6 +116,7 @@ export default function (pi: ExtensionAPI) {
       tokensSaved: state.tokensSaved,
       prunedToolIds: Array.from(state.prunedToolIds),
       lastCompressionStatus: state.lastCompressionStatus,
+      activeHermesLayout: state.activeHermesLayout,
     })
   })
 
@@ -99,13 +139,45 @@ export default function (pi: ExtensionAPI) {
       }
 
       const { preparation, signal } = event
-      const messagesToSummarize = [
+      const firstContextEntryId = findFirstContextEntryId(event.branchEntries)
+      if (!firstContextEntryId) {
+        const message = "Hermes compaction cancelled: no context entries to keep."
+        state.lastCompressionStatus = message
+        ctx.ui.notify(message, "warning")
+        return { cancel: true }
+      }
+
+      const compactedMessageCount = countContextEntries(event.branchEntries)
+      const tailMessageCount = countContextEntriesFrom(
+        event.branchEntries,
+        preparation.firstKeptEntryId,
+      )
+      const headMessageCount = Math.min(
+        AUTO_COMPRESS_CONFIG.protectFirstN,
+        compactedMessageCount,
+      )
+      const allMessagesBeforeTail = [
         ...preparation.messagesToSummarize,
         ...preparation.turnPrefixMessages,
       ]
+      const messagesToSummarize = allMessagesBeforeTail.slice(headMessageCount)
+
+      if (tailMessageCount <= 0) {
+        const message = "Hermes compaction cancelled: Pi did not identify a tail to keep."
+        state.lastCompressionStatus = message
+        ctx.ui.notify(message, "warning")
+        return { cancel: true }
+      }
+
+      if (messagesToSummarize.length <= 0) {
+        const message = "Hermes compaction cancelled: no middle messages to summarize."
+        state.lastCompressionStatus = message
+        ctx.ui.notify(message, "warning")
+        return { cancel: true }
+      }
 
       ctx.ui.notify(
-        `Hermes compaction: summarizing ${messagesToSummarize.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)...`,
+        `Hermes compaction: keeping ${headMessageCount} head messages and ${tailMessageCount} Pi-tail messages; summarizing ${messagesToSummarize.length} middle messages...`,
         "info",
       )
 
@@ -132,16 +204,32 @@ export default function (pi: ExtensionAPI) {
       }
 
       state.previousSummary = result.summary
+      const summaryTokens = estimateMessagesTokens([
+        { role: "user", content: [{ type: "text", text: result.summary }] },
+      ])
+      const estimatedTokensSaved = estimateMessagesTokens(messagesToSummarize) - summaryTokens
+      const estimatedTokensAfter = preparation.tokensBefore - estimatedTokensSaved
+      const layout: HermesMiddleLayout = {
+        kind: "hermes-middle",
+        headMessageCount,
+        tailMessageCount,
+        compactedMessageCount,
+        originalFirstKeptEntryId: preparation.firstKeptEntryId,
+        expandedFirstKeptEntryId: firstContextEntryId,
+        estimatedTokensAfter,
+        estimatedTokensSaved,
+      }
+      state.activeHermesLayout = layout
       state.lastCompressionStatus =
-        `Hermes compaction ready: summarized ${messagesToSummarize.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)`
+        `Hermes compaction ready: head ${headMessageCount}, middle ${messagesToSummarize.length}, tail ${tailMessageCount}, estimated saved ~${estimatedTokensSaved.toLocaleString()} tokens`
 
       return {
         compaction: {
           summary: result.summary,
-          firstKeptEntryId: preparation.firstKeptEntryId,
+          firstKeptEntryId: firstContextEntryId,
           tokensBefore: preparation.tokensBefore,
           details: {
-            kind: "hermes-middle",
+            ...layout,
             sweptToolOutputs: state.prunedToolIds.size,
           },
         },
@@ -161,17 +249,23 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact", async (event, ctx) => {
     if (event.fromExtension) {
       state.compressionCount++
+      if (state.activeHermesLayout) {
+        state.tokensSaved += state.activeHermesLayout.estimatedTokensSaved
+      }
       state.lastCompressionStatus = "Hermes compaction completed"
       if (ctx.hasUI) ctx.ui.notify("Hermes compaction completed", "info")
     }
   })
   
   pi.on("context", async (event, ctx) => {
-    const result = await applyPruning(event.messages, state, config)
-    if (result.outcome) {
-      state.lastCompressionStatus = result.outcome.message
+    const layoutResult = applyHermesMiddleLayout(event.messages, state)
+    const pruneResult = await applyPruning(layoutResult.messages, state, config)
+    if (pruneResult.outcome) {
+      state.lastCompressionStatus = pruneResult.outcome.message
+    } else if (layoutResult.outcome) {
+      state.lastCompressionStatus = layoutResult.outcome.message
     }
-    return { messages: result.messages }
+    return { messages: pruneResult.messages }
   })
 
   pi.registerCommand("acp", {

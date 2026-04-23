@@ -149,6 +149,45 @@ export function estimateMessagesTokens(messages: any[]): number {
   return messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
 }
 
+export function applyHermesMiddleLayout(
+  messages: any[],
+  state: DcpState,
+): ApplyPruningResult {
+  const layout = state.activeHermesLayout;
+  if (!layout) return { messages };
+
+  const summaryIdx = messages.findIndex((msg) => msg?.role === "compactionSummary");
+  if (summaryIdx < 0) return { messages };
+
+  const summaryMessage = messages[summaryIdx];
+  const rawMessages = messages.filter((_, idx) => idx !== summaryIdx);
+  const compactedMessageCount = Math.min(layout.compactedMessageCount, rawMessages.length);
+  const headEnd = Math.min(layout.headMessageCount, compactedMessageCount);
+  const tailStart = Math.max(headEnd, compactedMessageCount - layout.tailMessageCount);
+
+  const shapedMessages = [
+    ...rawMessages.slice(0, headEnd),
+    summaryMessage,
+    ...rawMessages.slice(tailStart),
+  ];
+
+  const originalTokens = estimateMessagesTokens(messages);
+  const shapedTokens = estimateMessagesTokens(shapedMessages);
+  const saved = originalTokens - shapedTokens;
+  const delta = saved >= 0
+    ? `saved ~${saved.toLocaleString()} tokens`
+    : `added ~${Math.abs(saved).toLocaleString()} tokens`;
+
+  return {
+    messages: shapedMessages,
+    outcome: {
+      kind: "compressed",
+      message: `Hermes middle layout: ${messages.length} -> ${shapedMessages.length} messages, ${delta}`,
+      tokensSaved: saved,
+    },
+  };
+}
+
 function alignBoundaryForward(messages: any[], idx: number): number {
   while (idx < messages.length && isToolResultMessage(messages[idx])) {
     idx++;

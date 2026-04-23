@@ -4,7 +4,7 @@
 Prevent pi-auto-compressor from removing valid Pi tool results from the model context.
 
 ## Scope
-In: Pi native assistant tool-call content blocks, tool-result pairing, token estimates, summary serialization, protected-tail tool sweeping, Hermes compaction override status.
+In: Pi native assistant tool-call content blocks, tool-result pairing, token estimates, summary serialization, protected-tail tool sweeping, Hermes compaction override status, Hermes head+middle+tail request layout.
 Out: Changing compression thresholds or persistent session storage.
 
 ## Requirements
@@ -13,6 +13,7 @@ Out: Changing compression thresholds or persistent session storage.
 - R3: Keep legacy compatibility. Done means: existing OpenAI-style `tool_calls` fallback still works when present. VERIFY: helper handles both shapes.
 - R4: Manual Hermes compaction runs through Pi's compaction lifecycle. Done means: `/acp compress` refuses active/queued runs, calls `ctx.compact()`, and `session_before_compact` supplies a custom Hermes `CompactionResult` or cancels. VERIFY: TypeScript compiles and subagent review finds no blocker.
 - R5: Tool sweeping is simple and tail-safe. Done means: old, large tool outputs outside the protected tail are tombstoned while recent tail outputs are preserved. VERIFY: focused scripts show an old 250-char result is swept and a tail 250-char result is kept.
+- R6: Manual Hermes compaction is actual middle compaction. Done means: Pi's natural compaction cut still chooses the tail, but the extension keeps raw head available and the context hook sends `head + summary + tail` to the model. VERIFY: focused script shows a `compactionSummary` moves between raw head and raw tail while middle raw messages are removed.
 
 ## Tasks
 - [x] T1 (R1-R3): Patch `pruner.ts`.
@@ -35,6 +36,12 @@ Out: Changing compression thresholds or persistent session storage.
   - success: old output prints a tombstone; tail output length remains 250.
   - likely_fail: recent tool output is swept.
   - sneaky_fail: swept tool result is deleted instead of tombstoned.
+- [x] T5 (R6): Shape compacted request context as Hermes middle.
+  - steps: store compaction layout metadata, expand `firstKeptEntryId` to the first context entry, reshape `context` messages to head/summary/tail before pruning.
+  - verify: `npx tsc --noEmit`; focused script calling `applyHermesMiddleLayout()`.
+  - success: output roles are `user, user, compactionSummary, user, user` for a 6-message compacted prefix with head=2/tail=2.
+  - likely_fail: summary stays first, proving plain Pi `summary + tail`.
+  - sneaky_fail: middle is summarized but new post-compaction messages are dropped; script includes extra messages after compacted prefix to catch this.
 
 ## Log
 - Pi messages use assistant `content` blocks with `type: "toolCall"`; they do not use `msg.tool_calls` as the primary shape.
@@ -44,3 +51,5 @@ Out: Changing compression thresholds or persistent session storage.
 - The compaction override cancels on no model, auth failure, thrown errors, empty summaries, or non-`stop` summary responses; it does not intentionally fall back to Pi default compaction.
 - Tool sweep script output: old 250-char `bash` result becomes `[Tool output swept: ...]`; protected-tail 250-char result remains length 250.
 - Subagent review found and fixes addressed: reject truncated/error summary responses, avoid tombstoning currently protected-tail messages even when ID was previously marked, and wrap compaction hook with cancel-on-error.
+- Pi `CompactionResult` only persists `summary`, `firstKeptEntryId`, and `tokensBefore`. To get Hermes `head + middle summary + tail`, use Pi's natural `preparation.firstKeptEntryId` only to count the tail, persist layout metadata in `details`, set the actual saved `firstKeptEntryId` to the first context entry, and reshape the model request in the `context` hook.
+- Hermes layout script output: `head-1|head-2|summary|tail-1|tail-2|after-new` and message count `6`.

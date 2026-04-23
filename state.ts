@@ -19,6 +19,18 @@ export interface DcpState {
   compressionCount: number
   forceCompressNext?: boolean
   lastCompressionStatus?: string | null
+  activeHermesLayout?: HermesMiddleLayout | null
+}
+
+export interface HermesMiddleLayout {
+  kind: "hermes-middle"
+  headMessageCount: number
+  tailMessageCount: number
+  compactedMessageCount: number
+  originalFirstKeptEntryId: string
+  expandedFirstKeptEntryId: string
+  estimatedTokensAfter: number
+  estimatedTokensSaved: number
 }
 
 export function createState(): DcpState {
@@ -32,6 +44,7 @@ export function createState(): DcpState {
     compressionCount: 0,
     forceCompressNext: false,
     lastCompressionStatus: null,
+    activeHermesLayout: null,
   }
 }
 
@@ -45,6 +58,7 @@ export function resetState(state: DcpState): void {
   state.compressionCount = 0
   state.forceCompressNext = false
   state.lastCompressionStatus = null
+  state.activeHermesLayout = null
 }
 
 function sortObjectKeys(value: unknown): unknown {
