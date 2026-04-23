@@ -89,7 +89,7 @@ export default function (pi: ExtensionAPI) {
       const argsStr = args.trim().toLowerCase();
       if (argsStr === "compress") {
         state.forceCompressNext = true;
-        ctx.ui.notify("Manual compression triggered. It will run in the background on the next agent turn.", "info");
+        ctx.ui.notify("Manual compression scheduled. It will run when you send your next message.", "info");
         return;
       }
       
@@ -110,16 +110,17 @@ export default function (pi: ExtensionAPI) {
       }
       
       const lines = [
-        "Auto-Compressor (Hermes) Stats:",
-        `  Total Compressions: ${state.compressionCount}`,
-        `  Tokens Saved (Compaction): ~${state.tokensSaved.toLocaleString()}`,
-        `  Tokens Saved (Tool Pruning): ~${prunedToolTokens.toLocaleString()}`,
-        `  Total Tool Calls Tracked: ${state.toolCalls.size}`,
-        `  Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
-        `  Total Tool Tokens Generated: ~${totalToolTokens.toLocaleString()}`,
-        `  Current User Turn: ${state.currentTurn}`,
-        `  Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
-        `  Current Context Tokens: ${tokenStr}`,
+        `Auto-Compressor (Hermes) Stats:`,
+        `   Total Compressions: ${state.compressionCount}`,
+        `   Pending Compression: ${state.forceCompressNext ? "YES (Scheduled for next turn)" : "No"}`,
+        `   Tokens Saved (Compaction): ~${state.tokensSaved.toLocaleString()}`,
+        `   Tokens Saved (Tool Pruning): ~${prunedToolTokens.toLocaleString()}`,
+        `   Total Tool Calls Tracked: ${state.toolCalls.size}`,
+        `   Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
+        `   Total Tool Tokens Generated: ~${totalToolTokens.toLocaleString()}`,
+        `   Current User Turn: ${state.currentTurn}`,
+        `   Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
+        `   Current Context Tokens: ${tokenStr}`,
         "",
         "Type '/acp compress' to force a compression on the next turn."
       ];

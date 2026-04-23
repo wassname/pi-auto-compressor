@@ -372,18 +372,26 @@ export async function applyPruning(
     state.forceCompressNext || 
     (totalTokens >= thresholdTokens && msgs.length > AUTO_COMPRESS_CONFIG.protectFirstN + 4)
   ) {
+    const wasForced = state.forceCompressNext;
+    state.forceCompressNext = false;
+
     let tailBudget = Math.floor(thresholdTokens * AUTO_COMPRESS_CONFIG.summaryTargetRatio);
-    if (state.forceCompressNext) {
-      // Force compression: reduce tail budget to ensure we have something to compress
-      tailBudget = Math.min(tailBudget, Math.floor(totalTokens * 0.3));
+    if (wasForced) {
+      // Force compression: use a tiny tail budget to ensure we summarize almost everything
+      tailBudget = Math.max(100, Math.floor(totalTokens * 0.05));
     }
 
-    state.forceCompressNext = false;
     const compressStart = alignBoundaryForward(msgs, AUTO_COMPRESS_CONFIG.protectFirstN);
     const compressEnd = findTailCutByTokens(msgs, compressStart, tailBudget);
 
-    if (compressStart < compressEnd) {
-      const middle = msgs.slice(compressStart, compressEnd);
+    // If forced, we MUST compress something if we have any messages after protectFirstN
+    let finalCompressEnd = compressEnd;
+    if (wasForced && finalCompressEnd <= compressStart && msgs.length > compressStart + 1) {
+      finalCompressEnd = msgs.length - 1;
+    }
+
+    if (compressStart < finalCompressEnd) {
+      const middle = msgs.slice(compressStart, finalCompressEnd);
       const summary = await generateSummary(middle, state.previousSummary, null, model);
 
       if (summary) {
@@ -394,7 +402,7 @@ export async function applyPruning(
         }
 
         const lastHeadRole = msgs[compressStart - 1]?.role || "user";
-        const firstTailRole = msgs[compressEnd]?.role || "user";
+        const firstTailRole = msgs[finalCompressEnd]?.role || "user";
 
         let summaryRole = lastHeadRole === "assistant" ? "user" : "assistant";
         if (summaryRole === firstTailRole) {
@@ -402,13 +410,13 @@ export async function applyPruning(
           if (flipped !== lastHeadRole) {
             summaryRole = flipped;
           } else {
-            const tailMsg = { ...msgs[compressEnd], timestamp: msgs[compressEnd].timestamp || Date.now() };
+            const tailMsg = { ...msgs[finalCompressEnd], timestamp: msgs[finalCompressEnd].timestamp || Date.now() };
             const originalContent = tailMsg.content || "";
             tailMsg.content = 
               "## Goal\n" + summary + "\n\n--- END OF CONTEXT SUMMARY ---\n\n" + 
               (typeof originalContent === "string" ? originalContent : "");
             compressed.push(tailMsg);
-            for (let i = compressEnd + 1; i < msgs.length; i++) {
+            for (let i = finalCompressEnd + 1; i < msgs.length; i++) {
               compressed.push(msgs[i]);
             }
             state.previousSummary = summary;
@@ -430,7 +438,7 @@ export async function applyPruning(
           timestamp: Date.now(),
         });
 
-        for (let i = compressEnd; i < msgs.length; i++) {
+        for (let i = finalCompressEnd; i < msgs.length; i++) {
           compressed.push(msgs[i]);
         }
 
@@ -440,11 +448,10 @@ export async function applyPruning(
         return sanitizeToolPairs(compressed);
       }
     } else {
-      if (config.debug) {
-        console.log(`[ACP] Compression skipped: conversation too short (start: ${compressStart}, end: ${compressEnd})`);
+      if (config.debug || wasForced) {
+        console.log(`[ACP] Compression skipped: conversation too short (start: ${compressStart}, end: ${finalCompressEnd})`);
       }
     }
-  }
-  
+  }  
   return sanitizeToolPairs(msgs);
 }
