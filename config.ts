@@ -1,14 +1,11 @@
-import * as fs from "node:fs"
-import * as path from "node:path"
-import * as os from "node:os"
-import { parse as parseJsonc } from "jsonc-parser"
-
 export const AUTO_COMPRESS_CONFIG = {
   thresholdPercent: 0.50,      // compress when tokens > 50% of context window
   minimumContextLength: 64000, // never compress below this threshold
   protectFirstN: 3,            // messages: system prompt + first exchange
+  protectLastN: 20,            // keep recent context intact
   summaryTargetRatio: 0.20,    // tail budget = threshold * 0.20
   charsPerToken: 4,            // rough estimate
+  minToolOutputPruneChars: 200,
 };
 
 export interface DcpConfig {

@@ -1,7 +1,118 @@
 import type { DcpState } from "./state.js"
 import { type DcpConfig, AUTO_COMPRESS_CONFIG } from "./config.js"
 
-const ALWAYS_PROTECTED_DEDUP = new Set(["compress", "write", "edit"]);
+const ALWAYS_PROTECTED_TOOLS = new Set(["compress", "write", "edit"]);
+
+export interface PruningOutcome {
+  kind: "compressed" | "skipped" | "failed"
+  message: string
+  tokensSaved?: number
+}
+
+export interface ApplyPruningResult {
+  messages: any[]
+  outcome?: PruningOutcome
+}
+
+export interface SummaryAuth {
+  apiKey?: string
+  headers?: Record<string, string>
+  [key: string]: unknown
+}
+
+export interface SummaryResult {
+  ok: boolean
+  summary?: string
+  error?: string
+}
+
+function isToolResultMessage(msg: any): boolean {
+  return msg?.role === "toolResult" || msg?.role === "tool";
+}
+
+function getToolResultId(msg: any): string | undefined {
+  return msg?.toolCallId || msg?.tool_call_id;
+}
+
+function getAssistantToolCalls(msg: any): any[] {
+  const calls: any[] = [];
+
+  if (Array.isArray(msg?.content)) {
+    for (const block of msg.content) {
+      if (block?.type === "toolCall") calls.push(block);
+    }
+  }
+
+  if (Array.isArray(msg?.tool_calls)) {
+    calls.push(...msg.tool_calls);
+  }
+
+  return calls;
+}
+
+function getToolCallId(call: any): string | undefined {
+  return call?.id;
+}
+
+function getToolCallName(call: any): string {
+  return call?.name || call?.function?.name || "?";
+}
+
+function getToolCallArgsText(call: any): string {
+  const args = call?.arguments ?? call?.function?.arguments ?? "";
+  return typeof args === "string" ? args : JSON.stringify(args);
+}
+
+function getMessageText(msg: any): string {
+  const content = msg?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part: any) => {
+      if (typeof part?.text === "string") return part.text;
+      if (typeof part?.thinking === "string") return part.thinking;
+      return "";
+    })
+    .join("");
+}
+
+function getToolOutputChars(msg: any): number {
+  return getMessageText(msg).length;
+}
+
+function textContent(text: string): Array<{ type: "text"; text: string }> {
+  return [{ type: "text", text }];
+}
+
+function prependTextContent(content: unknown, text: string): Array<any> {
+  const prefix = { type: "text", text };
+  if (Array.isArray(content)) return [prefix, ...content];
+  if (typeof content === "string" && content.length > 0) {
+    return [prefix, { type: "text", text: content }];
+  }
+  return [prefix];
+}
+
+function makeCompressionOutcome(
+  originalCount: number,
+  compressedCount: number,
+  originalTokens: number,
+  compressedTokens: number,
+): PruningOutcome {
+  const saved = originalTokens - compressedTokens;
+  const delta = saved >= 0 ? `saved ~${saved.toLocaleString()} tokens` : `added ~${Math.abs(saved).toLocaleString()} tokens`;
+  return {
+    kind: "compressed",
+    message: `compressed Hermes request context: ${originalCount} -> ${compressedCount} messages, ${delta}`,
+    tokensSaved: saved,
+  };
+}
+
+function markToolPruned(state: DcpState, id: string | undefined): void {
+  if (!id || state.prunedToolIds.has(id)) return;
+  state.prunedToolIds.add(id);
+  state.totalPruneCount++;
+}
 
 export function estimateMessageTokens(msg: any): number {
   if (!msg) return 0;
@@ -17,16 +128,18 @@ export function estimateMessageTokens(msg: any): number {
         if (typeof part.text === "string") text += part.text;
         else if (typeof part.thinking === "string") text += part.thinking;
         else if (part.type === "image") text += "image";
+        else if (part.type === "toolCall") text += getToolCallArgsText(part);
       }
     }
   }
   
   let tokens = Math.round(text.length / 4) + 10;
   
-  const toolCalls = msg.tool_calls || [];
-  for (const tc of toolCalls) {
-    const args = tc?.function?.arguments || "";
-    tokens += Math.round(args.length / 4);
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) {
+      const args = getToolCallArgsText(tc);
+      tokens += Math.round(args.length / 4);
+    }
   }
   
   return tokens;
@@ -37,7 +150,7 @@ export function estimateMessagesTokens(messages: any[]): number {
 }
 
 function alignBoundaryForward(messages: any[], idx: number): number {
-  while (idx < messages.length && messages[idx]?.role === "tool") {
+  while (idx < messages.length && isToolResultMessage(messages[idx])) {
     idx++;
   }
   return idx;
@@ -46,10 +159,10 @@ function alignBoundaryForward(messages: any[], idx: number): number {
 function alignBoundaryBackward(messages: any[], idx: number): number {
   if (idx <= 0 || idx >= messages.length) return idx;
   let check = idx - 1;
-  while (check >= 0 && messages[check]?.role === "tool") {
+  while (check >= 0 && isToolResultMessage(messages[check])) {
     check--;
   }
-  if (check >= 0 && messages[check]?.role === "assistant" && messages[check]?.tool_calls) {
+  if (check >= 0 && messages[check]?.role === "assistant" && getAssistantToolCalls(messages[check]).length > 0) {
     idx = check;
   }
   return idx;
@@ -62,7 +175,7 @@ function findTailCutByTokens(
   charsPerToken: number = 4
 ): number {
   const n = messages.length;
-  const minTail = Math.min(3, n - headEnd - 1);
+  const minTail = Math.min(AUTO_COMPRESS_CONFIG.protectLastN, n - headEnd - 1);
   const softCeiling = Math.floor(tokenBudget * 1.5);
   let accumulated = 0;
   let cutIdx = n;
@@ -106,15 +219,15 @@ function serializeForSummary(turns: any[]): string {
       content = content.slice(0, HEAD_KEEP) + "\n...[truncated]...\n" + content.slice(-TAIL_KEEP);
     }
     
-    if (role === "tool" || role === "toolResult") {
-      const toolId = msg.tool_call_id || msg.toolCallId || "";
+    if (isToolResultMessage(msg)) {
+      const toolId = getToolResultId(msg) || "";
       parts.push(`[TOOL RESULT ${toolId}]: ${content}`);
     } else if (role === "assistant") {
-      const toolCalls = msg.tool_calls || [];
+      const toolCalls = getAssistantToolCalls(msg);
       if (toolCalls.length > 0) {
         const tcParts = toolCalls.map((tc: any) => {
-          const name = tc?.function?.name || "?";
-          const args = tc?.function?.arguments || "";
+          const name = getToolCallName(tc);
+          const args = getToolCallArgsText(tc);
           const argsShort = args.length > 150 ? args.slice(0, 120) + "..." : args;
           return `  ${name}(${argsShort})`;
         });
@@ -128,12 +241,13 @@ function serializeForSummary(turns: any[]): string {
   return parts.join("\n\n");
 }
 
-async function generateSummary(
+export async function generateHermesSummary(
   turns: any[],
   previousSummary: string | null,
   focusTopic: string | null,
   model: any,
-): Promise<string | null> {
+  auth?: SummaryAuth,
+): Promise<SummaryResult> {
   const contentToSummarize = serializeForSummary(turns);
   
   const summarizerPreamble = 
@@ -213,11 +327,18 @@ Prioritize preserving all information related to the focus topic.`;
   }
 
   try {
-    if (!model) return null;
+    if (!model) return { ok: false, error: "no model available" };
     const piAi = await import("@mariozechner/pi-ai");
     const response = await piAi.complete(model, {
       messages: [{ role: "user", content: prompt, timestamp: Date.now() }]
-    });
+    }, auth);
+
+    if (response.stopReason !== "stop") {
+      return {
+        ok: false,
+        error: `summary generation stopped with ${response.stopReason}${response.errorMessage ? `: ${response.errorMessage}` : ""}`,
+      };
+    }
 
     let text = "";
     if (Array.isArray(response.content)) {
@@ -229,10 +350,12 @@ Prioritize preserving all information related to the focus topic.`;
       text = (response as any).content;
     }
 
-    return text.trim() || null;
+    const summary = text.trim();
+    return summary ? { ok: true, summary } : { ok: false, error: "summary generation returned empty text" };
   } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
     console.error("Summary generation failed:", e);
-    return null;
+    return { ok: false, error };
   }
 }
 
@@ -240,101 +363,139 @@ function sanitizeToolPairs(messages: any[]): any[] {
   const assistantToolIds = new Set<string>();
   for (const msg of messages) {
     if (msg.role !== "assistant") continue;
-    for (const tc of msg.tool_calls || []) {
-      const id = tc?.id || tc?.function?.name;
+    for (const tc of getAssistantToolCalls(msg)) {
+      const id = getToolCallId(tc);
       if (id) assistantToolIds.add(id);
     }
   }
   
   const resultToolIds = new Set<string>();
   for (const msg of messages) {
-    if (msg.role !== "tool" && msg.role !== "toolResult") continue;
-    const id = msg.tool_call_id || msg.toolCallId;
+    if (!isToolResultMessage(msg)) continue;
+    const id = getToolResultId(msg);
     if (id) resultToolIds.add(id);
   }
   
   const cleaned = messages.filter((msg) => {
-    if (msg.role !== "tool" && msg.role !== "toolResult") return true;
-    const id = msg.tool_call_id || msg.toolCallId;
+    if (!isToolResultMessage(msg)) return true;
+    const id = getToolResultId(msg);
     return !id || assistantToolIds.has(id);
   });
   
   for (const msg of cleaned) {
-    if (msg.role !== "assistant" || !msg.tool_calls) continue;
-    msg.tool_calls = msg.tool_calls.filter((tc: any) => {
-      const id = tc?.id || tc?.function?.name;
-      return !id || resultToolIds.has(id);
-    });
+    if (msg.role !== "assistant") continue;
+    if (Array.isArray(msg.content)) {
+      msg.content = msg.content.filter((block: any) => {
+        if (block?.type !== "toolCall") return true;
+        const id = getToolCallId(block);
+        return !id || resultToolIds.has(id);
+      });
+    }
+    if (Array.isArray(msg.tool_calls)) {
+      msg.tool_calls = msg.tool_calls.filter((tc: any) => {
+        const id = getToolCallId(tc);
+        return !id || resultToolIds.has(id);
+      });
+    }
   }
   
   return cleaned;
 }
 
-function applyDeduplication(messages: any[], state: DcpState, config: DcpConfig): void {
+function applyDeduplication(messages: any[], state: DcpState, config: DcpConfig, sweepEnd: number): void {
   if (!config.strategies.deduplication.enabled) return;
 
   const protectedTools = new Set([
-    ...ALWAYS_PROTECTED_DEDUP,
+    ...ALWAYS_PROTECTED_TOOLS,
     ...(config.strategies.deduplication.protectedTools ?? []),
   ]);
 
   const fingerprintMap = new Map<string, string[]>();
 
-  for (const msg of messages) {
-    if (msg.role !== "toolResult") continue;
+  for (let i = AUTO_COMPRESS_CONFIG.protectFirstN; i < sweepEnd; i++) {
+    const msg = messages[i];
+    if (!isToolResultMessage(msg)) continue;
     const toolName: string = msg.toolName ?? "";
     if (protectedTools.has(toolName)) continue;
+    if (getToolOutputChars(msg) < AUTO_COMPRESS_CONFIG.minToolOutputPruneChars) continue;
 
-    const record = state.toolCalls.get(msg.toolCallId || msg.tool_call_id);
+    const record = state.toolCalls.get(getToolResultId(msg) || "");
     if (!record) continue;
 
     const fp = record.inputFingerprint;
     if (!fingerprintMap.has(fp)) {
       fingerprintMap.set(fp, []);
     }
-    fingerprintMap.get(fp)!.push(msg.toolCallId || msg.tool_call_id);
+    const id = getToolResultId(msg);
+    if (id) fingerprintMap.get(fp)!.push(id);
   }
 
   for (const [, ids] of fingerprintMap) {
     if (ids.length <= 1) continue;
     for (let i = 0; i < ids.length - 1; i++) {
-      state.prunedToolIds.add(ids[i]);
-      state.totalPruneCount++;
+      markToolPruned(state, ids[i]);
     }
   }
 }
 
-function applyErrorPurging(messages: any[], state: DcpState, config: DcpConfig): void {
+function applyErrorPurging(messages: any[], state: DcpState, config: DcpConfig, sweepEnd: number): void {
   if (!config.strategies.purgeErrors.enabled) return;
 
-  const protectedTools = new Set(config.strategies.purgeErrors.protectedTools ?? []);
+  const protectedTools = new Set([
+    ...ALWAYS_PROTECTED_TOOLS,
+    ...(config.strategies.purgeErrors.protectedTools ?? []),
+  ]);
   const turnsThreshold = config.strategies.purgeErrors.turns ?? 3;
 
-  for (const msg of messages) {
-    if (msg.role !== "toolResult") continue;
+  for (let i = AUTO_COMPRESS_CONFIG.protectFirstN; i < sweepEnd; i++) {
+    const msg = messages[i];
+    if (!isToolResultMessage(msg)) continue;
     if (!msg.isError) continue;
 
     const toolName: string = msg.toolName ?? "";
     if (protectedTools.has(toolName)) continue;
+    if (getToolOutputChars(msg) < AUTO_COMPRESS_CONFIG.minToolOutputPruneChars) continue;
 
-    const record = state.toolCalls.get(msg.toolCallId || msg.tool_call_id);
+    const id = getToolResultId(msg);
+    const record = state.toolCalls.get(id || "");
     if (!record) continue;
 
     if (state.currentTurn - record.turnIndex >= turnsThreshold) {
-      state.prunedToolIds.add(msg.toolCallId || msg.tool_call_id);
-      state.totalPruneCount++;
+      markToolPruned(state, id);
     }
   }
 }
 
-function applyToolOutputPruning(messages: any[], state: DcpState): void {
-  for (const msg of messages) {
-    if (msg.role !== "toolResult") continue;
-    if (!state.prunedToolIds.has(msg.toolCallId || msg.tool_call_id)) continue;
+function applyOldToolOutputSweeping(messages: any[], state: DcpState, config: DcpConfig, sweepEnd: number): void {
+  const protectedTools = new Set([
+    ...ALWAYS_PROTECTED_TOOLS,
+    ...(config.strategies.deduplication.protectedTools ?? []),
+    ...(config.strategies.purgeErrors.protectedTools ?? []),
+  ]);
+
+  for (let i = AUTO_COMPRESS_CONFIG.protectFirstN; i < sweepEnd; i++) {
+    const msg = messages[i];
+    if (!isToolResultMessage(msg)) continue;
+    if (protectedTools.has(msg.toolName ?? "")) continue;
+    if (getToolOutputChars(msg) < AUTO_COMPRESS_CONFIG.minToolOutputPruneChars) continue;
+
+    const id = getToolResultId(msg);
+    markToolPruned(state, id);
+  }
+}
+
+function applyToolOutputPruning(messages: any[], state: DcpState, sweepEnd: number): void {
+  for (let i = AUTO_COMPRESS_CONFIG.protectFirstN; i < sweepEnd; i++) {
+    const msg = messages[i];
+    if (!isToolResultMessage(msg)) continue;
+    const id = getToolResultId(msg);
+    if (!state.prunedToolIds.has(id || "")) continue;
+    const chars = getToolOutputChars(msg);
+    const toolName = msg.toolName || "unknown";
     if (msg.isError) {
-      msg.content = [{ type: "text", text: "[Error output removed - tool failed more than N turns ago]" }];
+      msg.content = [{ type: "text", text: `[Tool output swept: ${toolName} ${id || ""}, error output, ${chars.toLocaleString()} chars removed]` }];
     } else {
-      msg.content = [{ type: "text", text: "[Output removed to save context - information superseded or no longer needed]" }];
+      msg.content = [{ type: "text", text: `[Tool output swept: ${toolName} ${id || ""}, ${chars.toLocaleString()} chars removed]` }];
     }
   }
 }
@@ -343,8 +504,7 @@ export async function applyPruning(
   messages: any[],
   state: DcpState,
   config: DcpConfig,
-  model: any
-): Promise<any[]> {
+): Promise<ApplyPruningResult> {
   const msgs = messages.map((m: any) => {
     const clone = { ...m };
     if (Array.isArray(clone.content)) {
@@ -357,101 +517,15 @@ export async function applyPruning(
 
   state.currentTurn = msgs.filter((m) => m.role === "user").length;
 
-  applyDeduplication(msgs, state, config);
-  applyErrorPurging(msgs, state, config);
-  applyToolOutputPruning(msgs, state);
-  
-  const totalTokens = estimateMessagesTokens(msgs);
-  const contextLength = (config as any).contextLength || 128000; 
-  const thresholdTokens = Math.max(
-    Math.floor(contextLength * AUTO_COMPRESS_CONFIG.thresholdPercent),
-    AUTO_COMPRESS_CONFIG.minimumContextLength
+  const protectedTailStart = Math.max(
+    AUTO_COMPRESS_CONFIG.protectFirstN,
+    msgs.length - AUTO_COMPRESS_CONFIG.protectLastN,
   );
-  
-  if (
-    state.forceCompressNext || 
-    (totalTokens >= thresholdTokens && msgs.length > AUTO_COMPRESS_CONFIG.protectFirstN + 4)
-  ) {
-    const wasForced = state.forceCompressNext;
-    state.forceCompressNext = false;
 
-    let tailBudget = Math.floor(thresholdTokens * AUTO_COMPRESS_CONFIG.summaryTargetRatio);
-    if (wasForced) {
-      // Force compression: use a tiny tail budget to ensure we summarize almost everything
-      tailBudget = Math.max(100, Math.floor(totalTokens * 0.05));
-    }
+  applyOldToolOutputSweeping(msgs, state, config, protectedTailStart);
+  applyDeduplication(msgs, state, config, protectedTailStart);
+  applyErrorPurging(msgs, state, config, protectedTailStart);
+  applyToolOutputPruning(msgs, state, protectedTailStart);
 
-    const compressStart = alignBoundaryForward(msgs, AUTO_COMPRESS_CONFIG.protectFirstN);
-    const compressEnd = findTailCutByTokens(msgs, compressStart, tailBudget);
-
-    // If forced, we MUST compress something if we have any messages after protectFirstN
-    let finalCompressEnd = compressEnd;
-    if (wasForced && finalCompressEnd <= compressStart && msgs.length > compressStart + 1) {
-      finalCompressEnd = msgs.length - 1;
-    }
-
-    if (compressStart < finalCompressEnd) {
-      const middle = msgs.slice(compressStart, finalCompressEnd);
-      const summary = await generateSummary(middle, state.previousSummary, null, model);
-
-      if (summary) {
-        const compressed: any[] = [];
-
-        for (let i = 0; i < compressStart; i++) {
-          compressed.push(msgs[i]);
-        }
-
-        const lastHeadRole = msgs[compressStart - 1]?.role || "user";
-        const firstTailRole = msgs[finalCompressEnd]?.role || "user";
-
-        let summaryRole = lastHeadRole === "assistant" ? "user" : "assistant";
-        if (summaryRole === firstTailRole) {
-          const flipped = summaryRole === "user" ? "assistant" : "user";
-          if (flipped !== lastHeadRole) {
-            summaryRole = flipped;
-          } else {
-            const tailMsg = { ...msgs[finalCompressEnd], timestamp: msgs[finalCompressEnd].timestamp || Date.now() };
-            const originalContent = tailMsg.content || "";
-            tailMsg.content = 
-              "## Goal\n" + summary + "\n\n--- END OF CONTEXT SUMMARY ---\n\n" + 
-              (typeof originalContent === "string" ? originalContent : "");
-            compressed.push(tailMsg);
-            for (let i = finalCompressEnd + 1; i < msgs.length; i++) {
-              compressed.push(msgs[i]);
-            }
-            state.previousSummary = summary;
-            state.compressionCount++;
-            state.tokensSaved += totalTokens - estimateMessagesTokens(compressed);
-            return sanitizeToolPairs(compressed);
-          }
-        }
-
-        const prefix = 
-          "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. " +
-          "This is a handoff from a previous context window — treat it as background reference, " +
-          "NOT as active instructions. Do NOT answer questions or fulfill requests mentioned in this summary; " +
-          "they were already addressed. Respond ONLY to the latest user message that appears AFTER this summary:";
-
-        compressed.push({
-          role: summaryRole,
-          content: prefix + "\n\n" + summary,
-          timestamp: Date.now(),
-        });
-
-        for (let i = finalCompressEnd; i < msgs.length; i++) {
-          compressed.push(msgs[i]);
-        }
-
-        state.previousSummary = summary;
-        state.compressionCount++;
-        state.tokensSaved += totalTokens - estimateMessagesTokens(compressed);
-        return sanitizeToolPairs(compressed);
-      }
-    } else {
-      if (config.debug || wasForced) {
-        console.log(`[ACP] Compression skipped: conversation too short (start: ${compressStart}, end: ${finalCompressEnd})`);
-      }
-    }
-  }  
-  return sanitizeToolPairs(msgs);
+  return { messages: sanitizeToolPairs(msgs) };
 }

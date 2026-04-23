@@ -5,7 +5,7 @@ import {
   resetState,
   createInputFingerprint,
 } from "./state.js"
-import { applyPruning } from "./pruner.js"
+import { applyPruning, generateHermesSummary } from "./pruner.js"
 
 export default function (pi: ExtensionAPI) {
   const config = loadConfig(process.cwd())
@@ -65,6 +65,7 @@ export default function (pi: ExtensionAPI) {
         if (data?.compressionCount) state.compressionCount = data.compressionCount
         if (data?.tokensSaved) state.tokensSaved = data.tokensSaved
         if (data?.prunedToolIds) state.prunedToolIds = new Set(data.prunedToolIds)
+        if (data?.lastCompressionStatus) state.lastCompressionStatus = data.lastCompressionStatus
       }
     }
   })
@@ -75,12 +76,102 @@ export default function (pi: ExtensionAPI) {
       compressionCount: state.compressionCount,
       tokensSaved: state.tokensSaved,
       prunedToolIds: Array.from(state.prunedToolIds),
+      lastCompressionStatus: state.lastCompressionStatus,
     })
+  })
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    try {
+      const model = ctx.model
+      if (!model) {
+        const message = "Hermes compaction cancelled: no model selected."
+        state.lastCompressionStatus = message
+        ctx.ui.notify(message, "warning")
+        return { cancel: true }
+      }
+
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model)
+      if (!auth.ok) {
+        const message = `Hermes compaction cancelled: ${auth.error}`
+        state.lastCompressionStatus = message
+        ctx.ui.notify(message, "warning")
+        return { cancel: true }
+      }
+
+      const { preparation, signal } = event
+      const messagesToSummarize = [
+        ...preparation.messagesToSummarize,
+        ...preparation.turnPrefixMessages,
+      ]
+
+      ctx.ui.notify(
+        `Hermes compaction: summarizing ${messagesToSummarize.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)...`,
+        "info",
+      )
+
+      const result = await generateHermesSummary(
+        messagesToSummarize,
+        preparation.previousSummary ?? null,
+        event.customInstructions ?? null,
+        model,
+        {
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+          signal,
+          maxTokens: 8192,
+        },
+      )
+
+      if (!result.ok || !result.summary) {
+        if (!signal.aborted) {
+          const message = `Hermes compaction cancelled: ${result.error ?? "empty summary"}`
+          state.lastCompressionStatus = message
+          ctx.ui.notify(message, "warning")
+        }
+        return { cancel: true }
+      }
+
+      state.previousSummary = result.summary
+      state.lastCompressionStatus =
+        `Hermes compaction ready: summarized ${messagesToSummarize.length} messages (${preparation.tokensBefore.toLocaleString()} tokens)`
+
+      return {
+        compaction: {
+          summary: result.summary,
+          firstKeptEntryId: preparation.firstKeptEntryId,
+          tokensBefore: preparation.tokensBefore,
+          details: {
+            kind: "hermes-middle",
+            sweptToolOutputs: state.prunedToolIds.size,
+          },
+        },
+      }
+    } catch (error) {
+      const message = `Hermes compaction cancelled: ${error instanceof Error ? error.message : String(error)}`
+      state.lastCompressionStatus = message
+      try {
+        ctx.ui.notify(message, "warning")
+      } catch {
+        // Ignore UI failures; cancellation is the important safety behavior.
+      }
+      return { cancel: true }
+    }
+  })
+
+  pi.on("session_compact", async (event, ctx) => {
+    if (event.fromExtension) {
+      state.compressionCount++
+      state.lastCompressionStatus = "Hermes compaction completed"
+      if (ctx.hasUI) ctx.ui.notify("Hermes compaction completed", "info")
+    }
   })
   
   pi.on("context", async (event, ctx) => {
-    const prunedMessages = await applyPruning(event.messages, state, config, ctx.model)
-    return { messages: prunedMessages }
+    const result = await applyPruning(event.messages, state, config)
+    if (result.outcome) {
+      state.lastCompressionStatus = result.outcome.message
+    }
+    return { messages: result.messages }
   })
 
   pi.registerCommand("acp", {
@@ -88,8 +179,27 @@ export default function (pi: ExtensionAPI) {
     async handler(args, ctx) {
       const argsStr = args.trim().toLowerCase();
       if (argsStr === "compress") {
-        state.forceCompressNext = true;
-        ctx.ui.notify("Manual compression scheduled. It will run when you send your next message.", "info");
+        if (!ctx.isIdle()) {
+          ctx.ui.notify("Manual Hermes compaction can only run between turns; the agent is currently running.", "warning");
+          return;
+        }
+        if (ctx.hasPendingMessages()) {
+          ctx.ui.notify("Manual Hermes compaction can only run when there are no queued messages.", "warning");
+          return;
+        }
+        state.lastCompressionStatus = "Manual Hermes compaction started"
+        ctx.ui.notify("Manual Hermes compaction started", "info")
+        ctx.compact({
+          onComplete: () => {
+            state.lastCompressionStatus = "Manual Hermes compaction completed"
+            ctx.ui.notify("Manual Hermes compaction completed", "info")
+          },
+          onError: (error) => {
+            const message = `Manual Hermes compaction failed: ${error.message}`
+            state.lastCompressionStatus = message
+            ctx.ui.notify(message, "error")
+          },
+        })
         return;
       }
       
@@ -112,17 +222,18 @@ export default function (pi: ExtensionAPI) {
       const lines = [
         `Auto-Compressor (Hermes) Stats:`,
         `   Total Compressions: ${state.compressionCount}`,
-        `   Pending Compression: ${state.forceCompressNext ? "YES (Scheduled for next turn)" : "No"}`,
+        `   Pending Compression: No`,
         `   Tokens Saved (Compaction): ~${state.tokensSaved.toLocaleString()}`,
         `   Tokens Saved (Tool Pruning): ~${prunedToolTokens.toLocaleString()}`,
         `   Total Tool Calls Tracked: ${state.toolCalls.size}`,
-        `   Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
+        `   Swept Tool Outputs: ${state.prunedToolIds.size}`,
         `   Total Tool Tokens Generated: ~${totalToolTokens.toLocaleString()}`,
         `   Current User Turn: ${state.currentTurn}`,
         `   Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
+        `   Last Compression Status: ${state.lastCompressionStatus ?? "None"}`,
         `   Current Context Tokens: ${tokenStr}`,
         "",
-        "Type '/acp compress' to force a compression on the next turn."
+        "Type '/acp compress' between turns to run Hermes middle compaction."
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     }
