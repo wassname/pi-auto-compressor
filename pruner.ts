@@ -358,7 +358,11 @@ export async function applyPruning(
     AUTO_COMPRESS_CONFIG.minimumContextLength
   );
   
-  if (totalTokens >= thresholdTokens && msgs.length > AUTO_COMPRESS_CONFIG.protectFirstN + 4) {
+  if (
+    state.forceCompressNext || 
+    (totalTokens >= thresholdTokens && msgs.length > AUTO_COMPRESS_CONFIG.protectFirstN + 4)
+  ) {
+    state.forceCompressNext = false;
     const tailBudget = Math.floor(thresholdTokens * AUTO_COMPRESS_CONFIG.summaryTargetRatio);
     const compressStart = alignBoundaryForward(msgs, AUTO_COMPRESS_CONFIG.protectFirstN);
     const compressEnd = findTailCutByTokens(msgs, compressStart, tailBudget);

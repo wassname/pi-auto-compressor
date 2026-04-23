@@ -17,6 +17,7 @@ export interface DcpState {
   totalPruneCount: number
   previousSummary: string | null
   compressionCount: number
+  forceCompressNext?: boolean
 }
 
 export function createState(): DcpState {
@@ -28,6 +29,7 @@ export function createState(): DcpState {
     totalPruneCount: 0,
     previousSummary: null,
     compressionCount: 0,
+    forceCompressNext: false,
   }
 }
 
@@ -39,6 +41,7 @@ export function resetState(state: DcpState): void {
   state.totalPruneCount = 0
   state.previousSummary = null
   state.compressionCount = 0
+  state.forceCompressNext = false
 }
 
 function sortObjectKeys(value: unknown): unknown {

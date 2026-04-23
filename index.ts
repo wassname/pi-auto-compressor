@@ -84,8 +84,15 @@ export default function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("acp", {
-    description: "Auto-Compressor stats",
+    description: "Auto-Compressor stats and manual trigger",
     async handler(args, ctx) {
+      const argsStr = args.trim().toLowerCase();
+      if (argsStr === "compress") {
+        state.forceCompressNext = true;
+        ctx.ui.notify("Manual compression triggered. It will run in the background on the next agent turn.", "info");
+        return;
+      }
+      
       const usage = ctx.getContextUsage ? ctx.getContextUsage() : null;
       let tokenStr = "unavailable";
       if (usage && usage.tokens !== null) {
@@ -99,7 +106,9 @@ export default function (pi: ExtensionAPI) {
         `  Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
         `  Current User Turn: ${state.currentTurn}`,
         `  Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
-        `  Current Context Tokens: ${tokenStr}`
+        `  Current Context Tokens: ${tokenStr}`,
+        "",
+        "Type '/acp compress' to force a compression on the next turn."
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     }
