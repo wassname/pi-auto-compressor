@@ -79,7 +79,7 @@ export default function (pi: ExtensionAPI) {
   })
   
   pi.on("context", async (event, ctx) => {
-    const prunedMessages = await applyPruning(event.messages, state, config, (ctx as any).apiClient)
+    const prunedMessages = await applyPruning(event.messages, state, config, ctx.model)
     return { messages: prunedMessages }
   })
 
