@@ -99,11 +99,24 @@ export default function (pi: ExtensionAPI) {
         tokenStr = `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()}`;
       }
       
+      let totalToolTokens = 0;
+      let prunedToolTokens = 0;
+      
+      for (const record of state.toolCalls.values()) {
+        totalToolTokens += record.tokenEstimate || 0;
+        if (state.prunedToolIds.has(record.toolCallId)) {
+          prunedToolTokens += record.tokenEstimate || 0;
+        }
+      }
+      
       const lines = [
         "Auto-Compressor (Hermes) Stats:",
         `  Total Compressions: ${state.compressionCount}`,
-        `  Estimated Tokens Saved: ${state.tokensSaved.toLocaleString()}`,
+        `  Tokens Saved (Compaction): ~${state.tokensSaved.toLocaleString()}`,
+        `  Tokens Saved (Tool Pruning): ~${prunedToolTokens.toLocaleString()}`,
+        `  Total Tool Calls Tracked: ${state.toolCalls.size}`,
         `  Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
+        `  Total Tool Tokens Generated: ~${totalToolTokens.toLocaleString()}`,
         `  Current User Turn: ${state.currentTurn}`,
         `  Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
         `  Current Context Tokens: ${tokenStr}`,
