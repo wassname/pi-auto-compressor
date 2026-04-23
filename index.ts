@@ -82,4 +82,26 @@ export default function (pi: ExtensionAPI) {
     const prunedMessages = await applyPruning(event.messages, state, config, (ctx as any).apiClient)
     return { messages: prunedMessages }
   })
+
+  pi.registerCommand("acp", {
+    description: "Auto-Compressor stats",
+    async handler(args, ctx) {
+      const usage = ctx.getContextUsage ? ctx.getContextUsage() : null;
+      let tokenStr = "unavailable";
+      if (usage && usage.tokens !== null) {
+        tokenStr = `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()}`;
+      }
+      
+      const lines = [
+        "Auto-Compressor (Hermes) Stats:",
+        `  Total Compressions: ${state.compressionCount}`,
+        `  Estimated Tokens Saved: ${state.tokensSaved.toLocaleString()}`,
+        `  Pruned Tool Outputs (Deduplication/Errors): ${state.prunedToolIds.size}`,
+        `  Current User Turn: ${state.currentTurn}`,
+        `  Summary Exists (Has Compressed): ${state.previousSummary !== null ? "Yes" : "No"}`,
+        `  Current Context Tokens: ${tokenStr}`
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    }
+  });
 }
