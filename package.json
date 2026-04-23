@@ -1,0 +1,35 @@
+{
+  "name": "@wassname/pi-auto-compressor",
+  "version": "1.0.0",
+  "description": "PI coding agent extension — Automatic Middle-Slice Context Compression",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent",
+    "dynamic-context-pruning",
+    "auto-compressor",
+    "context",
+    "pruning"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "author": {
+    "name": "wassname"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
